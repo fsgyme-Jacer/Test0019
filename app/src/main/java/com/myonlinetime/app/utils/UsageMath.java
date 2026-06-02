@@ -1,3 +1,4 @@
+
 package com.myonlinetime.app.utils;
 
 import android.app.usage.UsageStats;
@@ -77,36 +78,78 @@ public class UsageMath {
         });
     }
 
+    // === Точное время за окно ===
+    // Однодневное окно считаем напрямую. Многодневное (например, неделя) собираем
+    // ПО ДНЯМ из посуточных срезов — это позволяет переиспользовать защитный кэш
+    // (UsageSafeCache) и сохранять удалённые приложения, которые система уже не
+    // отдаёт в живом запросе.
     public static Map<String, Long> getFilteredExactTimes(Context context, long start, long end) {
-        Set<String> currentInstalledApps = getInstalledAppsCached(context);
-        String launcherPkg = getDefaultLauncherCached(context);
+        Map<String, Long> total = new HashMap<>();
+        if (end <= start) return total;
 
-        // Один кэш валидности пакетов на весь вызов — убирает повторные IPC.
+        Set<String> installed = getInstalledAppsCached(context);
+        String launcher = getDefaultLauncherCached(context);
         Map<String, Boolean> validityCache = new HashMap<>();
 
-        Map<String, Long> systemData = fetchFromAndroidSystem(context, start, end, currentInstalledApps, launcherPkg, validityCache);
-
-        // === КЛЮЧЕВАЯ ЗАЩИТА ОТ ИЗМЕНЕНИЯ ИСТЁКШИХ ДНЕЙ ===
-        // Защитный кэш на диске хранит данные ПОСУТОЧНО (ключ = дата начала окна).
-        // Поэтому его допустимо читать/писать ТОЛЬКО для однодневного окна.
-        if (!isSingleDayWindow(start, end)) {
-            return systemData;
+        if (isSingleDayWindow(start, end)) {
+            return computeSingleDay(context, start, end, true, installed, launcher, validityCache);
         }
+
+        long segStart = start;
+        while (segStart < end) {
+            long nextMid = nextMidnightMillis(segStart);
+            long segEnd = Math.min(nextMid, end);
+
+            // Перезаписывать срез на диске разрешаем только для дней, выровненных
+            // по полуночи (полный день). Частичный «хвост» окна не должен затирать
+            // полноценный посуточный снимок.
+            boolean aligned = (segStart == startOfDayMillis(segStart));
+
+            Map<String, Long> dayMap = computeSingleDay(context, segStart, segEnd, aligned, installed, launcher, validityCache);
+            for (Map.Entry<String, Long> e : dayMap.entrySet()) {
+                Long cur = total.get(e.getKey());
+                total.put(e.getKey(), (cur == null ? 0L : cur) + e.getValue());
+            }
+            segStart = nextMid;
+        }
+        return total;
+    }
+
+    // === Точное время за ОДИН день + сохранение удалённых приложений ===
+    private static Map<String, Long> computeSingleDay(Context context, long start, long end, boolean allowWrite,
+                                                      Set<String> installed, String launcher, Map<String, Boolean> validityCache) {
+        Map<String, Long> systemData = fetchFromAndroidSystem(context, start, end, installed, launcher, validityCache);
 
         if (!systemData.isEmpty()) {
-            // Данные за этот день ещё доступны в системе → система = источник истины.
-            // Перезаписываем слот дня (set, НЕ max), чтобы истёкший день
-            // «замораживался» на правде и не рос со временем.
-            saveToSafeCache(context, start, systemData);
+            // === СОХРАНЕНИЕ УДАЛЁННЫХ ПРИЛОЖЕНИЙ ===
+            // Берём ранее замороженный срез этого дня. Приложения, которые система
+            // БОЛЬШЕ НЕ отдаёт (удалённые), но валидны (не системные) — возвращаем
+            // по их последнему замороженному времени. Для приложений, которые система
+            // ещё отдаёт, побеждают свежие данные (заморозка «на правде», без роста).
+            Map<String, Long> prior = loadFromSafeCache(context, start);
+            if (!prior.isEmpty()) {
+                for (Map.Entry<String, Long> e : prior.entrySet()) {
+                    String pkg = e.getKey();
+                    if (!systemData.containsKey(pkg)
+                            && isValidAppCached(context, pkg, installed, launcher, validityCache)) {
+                        systemData.put(pkg, e.getValue());
+                    }
+                }
+            }
+
+            if (allowWrite) {
+                saveToSafeCache(context, start, systemData);
+            }
             return systemData;
         }
 
-        // Данные за этот день уже вытеснены системой — отдаём то, что сохранили раньше.
+        // Живых данных за этот день уже нет — отдаём то, что заморозили ранее
+        // (только валидные пакеты).
         Map<String, Long> restored = new HashMap<>();
         Map<String, Long> safeData = loadFromSafeCache(context, start);
         for (Map.Entry<String, Long> entry : safeData.entrySet()) {
             String pkg = entry.getKey();
-            if (isValidAppCached(context, pkg, currentInstalledApps, launcherPkg, validityCache)) {
+            if (isValidAppCached(context, pkg, installed, launcher, validityCache)) {
                 restored.put(pkg, entry.getValue());
             }
         }
@@ -116,26 +159,36 @@ public class UsageMath {
     // Окно «однодневное», если целиком укладывается в сутки start (граница включительна).
     private static boolean isSingleDayWindow(long start, long end) {
         if (end <= start) return false;
+        return end <= nextMidnightMillis(start);
+    }
+
+    private static long startOfDayMillis(long ts) {
         Calendar cal = Calendar.getInstance();
-        cal.setTimeInMillis(start);
+        cal.setTimeInMillis(ts);
+        cal.set(Calendar.HOUR_OF_DAY, 0);
+        cal.set(Calendar.MINUTE, 0);
+        cal.set(Calendar.SECOND, 0);
+        cal.set(Calendar.MILLISECOND, 0);
+        return cal.getTimeInMillis();
+    }
+
+    private static long nextMidnightMillis(long ts) {
+        Calendar cal = Calendar.getInstance();
+        cal.setTimeInMillis(ts);
         cal.set(Calendar.HOUR_OF_DAY, 0);
         cal.set(Calendar.MINUTE, 0);
         cal.set(Calendar.SECOND, 0);
         cal.set(Calendar.MILLISECOND, 0);
         cal.add(Calendar.DAY_OF_YEAR, 1);
-        long nextDayStart = cal.getTimeInMillis();
-        return end <= nextDayStart;
+        return cal.getTimeInMillis();
     }
 
-    // === ИСПРАВЛЕНО: точное время за окно берём из ДНЕВНЫХ корзин getTotalTimeInForeground ===
-    // Почему так:
-    //  - queryEvents() на этом устройстве теряет ~30% событий → события БОЛЬШЕ НЕ используем.
-    //  - getTotalTimeInForeground() — точный таймер (на нём верно работают Месяц/Год и Wellbeing).
-    //  - queryAndAggregateUsageStats() брал ПОЛНЫЕ дневные корзины без обрезки → на однодневном
-    //    окне затекал «хвост» соседней корзины (границы корзин не выровнены по полуночи) → +30%.
-    // Решение: берём посуточные корзины (INTERVAL_DAILY) и обрезаем долю каждой корзины
-    // по фактическому пересечению с окном [start, end]. Это даёт точность и без занижения,
-    // и без завышения — и для одного дня, и для недели.
+    // === Точное время за окно берём из ДНЕВНЫХ корзин getTotalTimeInForeground ===
+    // queryEvents() на этом устройстве теряет ~30% событий → события не используем.
+    // queryAndAggregateUsageStats() брал ПОЛНЫЕ дневные корзины без обрезки → на
+    // однодневном окне затекал «хвост» соседней корзины (границы корзин не выровнены
+    // по полуночи) → +30%. Решение: посуточные корзины (INTERVAL_DAILY) с обрезкой
+    // доли каждой корзины по фактическому пересечению с окном [start, end].
     private static Map<String, Long> fetchFromAndroidSystem(Context context, long start, long end, Set<String> currentInstalledApps, String launcherPkg, Map<String, Boolean> validityCache) {
         Map<String, Long> results = new HashMap<>();
         UsageStatsManager usm = (UsageStatsManager) context.getSystemService(Context.USAGE_STATS_SERVICE);
@@ -161,7 +214,6 @@ public class UsageMath {
             if (time <= 0) continue;
 
             // === ОБРЕЗКА ПО ПЕРЕСЕЧЕНИЮ С ОКНОМ ===
-            // Убирает «нахлёст» дневных корзин на границах окна (главная причина +30% за день).
             if (bucketLast > bucketFirst) {
                 long overlap = Math.min(bucketLast, end) - Math.max(bucketFirst, start);
                 long span = bucketLast - bucketFirst;
