@@ -134,3 +134,4 @@ apksigner sign --ks "$KEYSTORE" \
 
 echo "✅ ГОТОВО! Файл: MyNewTime.apk"
 
+W
