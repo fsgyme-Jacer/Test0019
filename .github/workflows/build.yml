@@ -40,10 +40,10 @@ jobs:
         
         # Подписываем APK твоим ключом!
         $APKSIGNER sign --ks mykey.keystore --ks-pass "pass:$KEY_PASS" --out app-release-signed.apk app/build/outputs/apk/release/app-release-unsigned.apk
+        
+        - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+        name: app-debug
+        path: app/build/outputs/apk/debug/*.apk
 
-    - name: Upload Signed APK
-      uses: actions/upload-artifact@v4
-      with:
-        name: MyOnlineTime-Official-APK
-        path: app-release-signed.apk
-        retention-days: 10
